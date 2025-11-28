@@ -1,13 +1,40 @@
 /**
  * Telegram Bot for Claude Code
  * Long polling mode - no server required
+ *
+ * SECURITY FEATURES:
+ * - Mandatory authentication (whitelist required)
+ * - Rate limiting (10 requests/minute per user)
+ * - Path validation (prevents traversal attacks)
+ * - Input length validation
+ * - Sanitized error messages
  */
 
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
-const { callClaude, formatResponse } = require('./claude-caller');
+const path = require('path');
+const { callClaude, formatResponse, validateCwd } = require('./claude-caller');
 const { SessionManager } = require('./session-manager');
 const { ClaudeSessionDiscovery } = require('./claude-session-discovery');
+
+// Security constants
+const RATE_LIMIT_WINDOW = 60 * 1000;  // 1 minute
+const RATE_LIMIT_MAX = 10;            // Max 10 requests per minute
+const MAX_MESSAGE_LENGTH = 10000;     // Max message length
+
+// Blocked path patterns (system directories)
+const BLOCKED_PATHS = [
+    /^[A-Z]:\\Windows/i,
+    /^[A-Z]:\\Program Files/i,
+    /^[A-Z]:\\ProgramData/i,
+    /^\/etc/,
+    /^\/usr/,
+    /^\/bin/,
+    /^\/sbin/,
+    /^\/var/,
+    /^\/root/,
+    /^\/home\/[^/]+\/\./,  // Hidden files in home
+];
 
 class TelegramClaudeBot {
     constructor(options = {}) {
@@ -15,27 +42,105 @@ class TelegramClaudeBot {
         this.allowedChatIds = this.parseAllowedIds(options.allowedChatIds || process.env.TELEGRAM_ALLOWED_CHAT_IDS);
         this.defaultProjectDir = options.defaultProjectDir || process.env.DEFAULT_PROJECT_DIR || process.cwd();
         this.computerName = options.computerName || process.env.COMPUTER_NAME || require('os').hostname();
+        this.requireAuth = options.requireAuth !== false;  // Default: require authentication
         this.sessionManager = new SessionManager();
         this.sessionDiscovery = new ClaudeSessionDiscovery();
         this.bot = null;
         this.isRunning = false;
+
+        // Rate limiting: Map of chatId -> { count, resetTime }
+        this.rateLimits = new Map();
     }
 
     /**
      * Parse allowed chat IDs from string or array
      */
     parseAllowedIds(ids) {
-        if (!ids) return null;  // null means allow all
+        if (!ids) return null;
         if (Array.isArray(ids)) return ids.map(String);
-        return ids.split(',').map(s => s.trim());
+        return ids.split(',').map(s => s.trim()).filter(s => s.length > 0);
     }
 
     /**
      * Check if chat is allowed
+     * SECURITY: If no whitelist configured and requireAuth is true, deny all
      */
     isAllowed(chatId) {
-        if (!this.allowedChatIds) return true;  // Allow all if not configured
+        // If whitelist not configured
+        if (!this.allowedChatIds || this.allowedChatIds.length === 0) {
+            // In strict mode, deny all if no whitelist
+            if (this.requireAuth) {
+                console.log(`[Telegram] Auth denied for ${chatId}: No whitelist configured`);
+                return false;
+            }
+            return true;  // Allow all only if explicitly disabled
+        }
         return this.allowedChatIds.includes(String(chatId));
+    }
+
+    /**
+     * Check rate limit for a chat
+     * @returns {boolean} true if allowed, false if rate limited
+     */
+    checkRateLimit(chatId) {
+        const now = Date.now();
+        const key = String(chatId);
+
+        if (!this.rateLimits.has(key)) {
+            this.rateLimits.set(key, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
+            return true;
+        }
+
+        const limit = this.rateLimits.get(key);
+
+        // Reset if window expired
+        if (now > limit.resetTime) {
+            this.rateLimits.set(key, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
+            return true;
+        }
+
+        // Check if over limit
+        if (limit.count >= RATE_LIMIT_MAX) {
+            return false;
+        }
+
+        // Increment count
+        limit.count++;
+        return true;
+    }
+
+    /**
+     * Validate project path
+     * @returns {{valid: boolean, error: string, resolved: string}}
+     */
+    validateProjectPath(inputPath) {
+        if (!inputPath || typeof inputPath !== 'string') {
+            return { valid: false, error: 'Path is required', resolved: null };
+        }
+
+        const trimmed = inputPath.trim();
+
+        // Check length
+        if (trimmed.length > 500) {
+            return { valid: false, error: 'Path too long', resolved: null };
+        }
+
+        // Check for path traversal
+        if (trimmed.includes('..')) {
+            return { valid: false, error: 'Path traversal not allowed', resolved: null };
+        }
+
+        // Check against blocked patterns
+        for (const pattern of BLOCKED_PATHS) {
+            if (pattern.test(trimmed)) {
+                return { valid: false, error: 'Access to system directories not allowed', resolved: null };
+            }
+        }
+
+        // Resolve to absolute path
+        const resolved = path.resolve(trimmed);
+
+        return { valid: true, error: null, resolved };
     }
 
     /**
@@ -47,7 +152,17 @@ class TelegramClaudeBot {
             return false;
         }
 
+        // SECURITY WARNING: Check if authentication is properly configured
+        if (this.requireAuth && (!this.allowedChatIds || this.allowedChatIds.length === 0)) {
+            console.log('[Telegram] ⚠️  WARNING: No TELEGRAM_ALLOWED_CHAT_IDS configured!');
+            console.log('[Telegram] ⚠️  Bot will deny ALL requests until you configure a whitelist.');
+            console.log('[Telegram] ⚠️  Send /start to the bot to get your Chat ID, then add it to .env');
+        }
+
         console.log('[Telegram] Starting bot...');
+        console.log(`[Telegram] Computer: ${this.computerName}`);
+        console.log(`[Telegram] Auth required: ${this.requireAuth}`);
+        console.log(`[Telegram] Allowed IDs: ${this.allowedChatIds?.length || 0} configured`);
 
         this.bot = new TelegramBot(this.token, {
             polling: {
@@ -234,11 +349,42 @@ Tips:
 
         if (!this.isAllowed(chatId)) return;
 
-        // Normalize path
-        projectPath = projectPath.trim();
+        // SECURITY: Validate path
+        const validation = this.validateProjectPath(projectPath);
+        if (!validation.valid) {
+            await this.bot.sendMessage(chatId, `Invalid path: ${validation.error}`);
+            return;
+        }
 
-        this.sessionManager.setProjectDir('telegram', chatId, projectPath);
-        await this.bot.sendMessage(chatId, `Project directory set to:\n${projectPath}`);
+        // Auto-create directory if it doesn't exist
+        const fs = require('fs');
+        let created = false;
+        if (!fs.existsSync(validation.resolved)) {
+            try {
+                fs.mkdirSync(validation.resolved, { recursive: true });
+                created = true;
+            } catch (err) {
+                await this.bot.sendMessage(chatId, `Failed to create directory: ${err.message}`);
+                return;
+            }
+        }
+
+        // Check if directory is empty (Claude Code may hang on empty dirs)
+        // If empty, create a minimal README.md so Claude Code works properly
+        const files = fs.readdirSync(validation.resolved).filter(f => !f.startsWith('.'));
+        if (files.length === 0) {
+            const readmePath = require('path').join(validation.resolved, 'README.md');
+            const dirName = require('path').basename(validation.resolved);
+            fs.writeFileSync(readmePath, `# ${dirName}\n\nProject created via Claude Code Bot.\n`, 'utf8');
+            await this.bot.sendMessage(chatId, created
+                ? `Created directory and initialized: ${validation.resolved}`
+                : `Initialized empty directory: ${validation.resolved}`);
+        } else if (created) {
+            await this.bot.sendMessage(chatId, `Created directory: ${validation.resolved}`);
+        }
+
+        this.sessionManager.setProjectDir('telegram', chatId, validation.resolved);
+        await this.bot.sendMessage(chatId, `Project directory set to:\n${validation.resolved}`);
     }
 
     /**
@@ -352,8 +498,23 @@ Tips:
         const chatId = msg.chat.id;
         const text = msg.text;
 
+        // SECURITY: Check authentication
         if (!this.isAllowed(chatId)) {
-            await this.bot.sendMessage(chatId, 'Sorry, you are not authorized to use this bot.');
+            await this.bot.sendMessage(chatId,
+                `Access denied.\n\nYour Chat ID: ${chatId}\n\nAdd this ID to TELEGRAM_ALLOWED_CHAT_IDS in .env to authorize.`
+            );
+            return;
+        }
+
+        // SECURITY: Check rate limit
+        if (!this.checkRateLimit(chatId)) {
+            await this.bot.sendMessage(chatId, 'Rate limit exceeded. Please wait a moment.');
+            return;
+        }
+
+        // SECURITY: Validate input length
+        if (text.length > MAX_MESSAGE_LENGTH) {
+            await this.bot.sendMessage(chatId, `Message too long. Max ${MAX_MESSAGE_LENGTH} characters.`);
             return;
         }
 
@@ -382,7 +543,9 @@ Tips:
             }
 
             // Delete thinking message
-            await this.bot.deleteMessage(chatId, thinkingMsg.message_id);
+            try {
+                await this.bot.deleteMessage(chatId, thinkingMsg.message_id);
+            } catch (e) { /* Ignore delete errors */ }
 
             // Format and send response
             const response = formatResponse(result.result, 4000);
@@ -398,14 +561,16 @@ Tips:
             }
 
         } catch (error) {
-            console.log('[Telegram] Error calling Claude:', error);
+            // Log error internally but don't expose details
+            console.log('[Telegram] Error calling Claude:', error.message);
 
             // Delete thinking message
             try {
                 await this.bot.deleteMessage(chatId, thinkingMsg.message_id);
-            } catch (e) {}
+            } catch (e) { /* Ignore */ }
 
-            await this.bot.sendMessage(chatId, `Error: ${error.message}`);
+            // SECURITY: Generic error message (don't leak details)
+            await this.bot.sendMessage(chatId, 'An error occurred. Please try again.');
         }
     }
 

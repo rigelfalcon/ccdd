@@ -2,19 +2,186 @@
 
 这是一个智能提醒系统，用于在Claude Code完成任务时通过多种方式提醒你，支持手机通知和手环震动，让你可以专心玩手机而不用频繁检查任务状态。
 
-## 🎯 功能特点
+## 🎯 两大核心功能
 
-- ✅ **飞书通知推送**：任务完成时自动发送飞书消息到手机
-- ✅ **Telegram通知推送**：支持通过Telegram Bot发送通知消息
-- ✅ **HTTP代理支持**：Telegram通知支持HTTP/HTTPS代理配置
-- ✅ **手环震动提醒**：小米手环等智能穿戴设备会震动提醒
-- ✅ **语音声音提醒**：电脑播放"任务完成，已发送手机通知"
-- ✅ **双重提醒保障**：声音 + 手机推送，确保不会错过
-- ✅ **智能项目识别**：自动识别项目名称（package.json > git仓库名 > 目录名）
-- ✅ **精简消息格式**：项目名: 任务信息，适配手环显示
-- ✅ **Windows系统优化**：完美支持Windows 10/11
-- ✅ **配置灵活**：可自由开关各种提醒方式
-- ✅ **安全可靠**：使用官方API，安全稳定
+| 功能 | 说明 | 数据流向 |
+|------|------|----------|
+| **任务完成通知** | Claude Code 完成任务时推送通知 | Claude Code → 飞书/Telegram |
+| **远程控制** | 用手机向 Claude Code 发送指令 | 手机 ↔ Claude Code |
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    功能一：任务完成通知                    │
+│                                                         │
+│   Claude Code ──完成任务──> 飞书Webhook ──> 手机通知      │
+│                                            ↓            │
+│                                         手环震动         │
+└─────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────┐
+│                    功能二：远程控制                       │
+│                                                         │
+│   手机 ──发送消息──> Telegram/飞书Bot                    │
+│                           ↓                             │
+│                      Claude Code CLI                    │
+│                           ↓                             │
+│   手机 <──返回结果── Telegram/飞书Bot                    │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## ⚡ 快速开始
+
+### 只用功能一（任务完成通知）
+
+1. **创建飞书 Webhook**
+   - 飞书群 → 设置 → 群机器人 → 添加机器人 → 自定义机器人
+   - 复制 Webhook 地址
+
+2. **配置 `.env`**
+   ```bash
+   FEISHU_WEBHOOK_URL=你的Webhook地址
+   ```
+
+3. **配置 Claude Code Hook**
+
+   在 `~/.claude/settings.json` 添加：
+   ```json
+   {
+     "hooks": {
+       "Stop": [{
+         "hooks": [{
+           "type": "command",
+           "command": "node /path/to/ccdd/notify-system.js --message '任务完成'"
+         }]
+       }]
+     }
+   }
+   ```
+
+4. **测试**
+   ```bash
+   node notify-system.js --task "测试通知"
+   ```
+
+---
+
+### 要用功能二（远程控制）
+
+#### 方式 A：Telegram Bot（推荐，更简单）
+
+1. **创建 Bot**
+   - 打开 https://t.me/BotFather
+   - 发送 `/newbot`，按提示创建
+   - 复制 Token
+
+2. **配置 `.env`**
+   ```bash
+   TELEGRAM_BOT_TOKEN=你的Token
+   TELEGRAM_ALLOWED_CHAT_IDS=    # 先留空
+   ```
+
+3. **启动并获取 Chat ID**
+   ```bash
+   node bot-server.js
+   ```
+   然后在 Telegram 中给你的 Bot 发送 `/start`，Bot 会告诉你的 Chat ID
+
+4. **配置白名单**
+   ```bash
+   TELEGRAM_ALLOWED_CHAT_IDS=你的ChatID
+   ```
+
+5. **重启 Bot**
+   ```bash
+   node bot-server.js
+   ```
+
+#### 方式 B：飞书应用机器人
+
+1. **创建应用**
+   - 打开 https://open.feishu.cn/app
+   - 创建应用，启用"机器人"能力
+   - 添加事件：`im.message.receive_v1`
+   - 订阅方式选择"长连接"
+
+2. **配置 `.env`**
+   ```bash
+   FEISHU_APP_ID=你的AppID
+   FEISHU_APP_SECRET=你的AppSecret
+   FEISHU_ALLOWED_OPEN_IDS=    # 先留空
+   ```
+
+3. **启动并获取 Open ID**
+   ```bash
+   node bot-server.js
+   ```
+   然后在飞书中给机器人发消息，Bot 会告诉你的 Open ID
+
+4. **配置白名单并重启**
+
+---
+
+## 📱 远程控制命令
+
+| 命令 | 说明 |
+|------|------|
+| `/start` | 显示 Bot 信息和你的 ID |
+| `/new` | 清除会话，开始新对话 |
+| `/status` | 显示当前项目和会话状态 |
+| `/project <路径>` | 设置项目目录 |
+| `/project` | 查看当前项目目录 |
+| `/sessions` | 列出最近的 Claude Code 会话 |
+| `/resume <id>` | 恢复指定会话 |
+| `/help` | 显示帮助 |
+
+**使用示例：**
+```
+你：/project C:/Users/PC/code/my-project
+Bot：Project directory set to: C:/Users/PC/code/my-project
+
+你：帮我看看这个项目的结构
+Bot：🤔 Processing...
+Bot：[Claude Code 的回复]
+```
+
+---
+
+## 🔒 安全说明
+
+远程控制功能需要配置白名单才能使用：
+
+- **Telegram**: `TELEGRAM_ALLOWED_CHAT_IDS`
+- **飞书**: `FEISHU_ALLOWED_OPEN_IDS`
+
+**如果不配置白名单，Bot 会拒绝所有请求**（安全默认）。
+
+其他安全特性：
+- 速率限制：每用户每分钟最多 10 次请求
+- 路径验证：阻止访问系统目录
+- 输入长度限制：最大 10000 字符
+- 错误信息脱敏：不暴露系统细节
+
+---
+
+## 🧪 测试命令
+
+```bash
+# 测试任务完成通知
+node notify-system.js --task "测试通知"
+
+# 测试飞书 Webhook
+node feishu-notify.js --message "测试消息"
+
+# 启动远程控制 Bot
+node bot-server.js
+
+# 检查配置是否正确
+node check-config.js
+```
+
+---
 
 ## 📁 项目结构
 
