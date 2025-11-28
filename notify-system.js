@@ -239,13 +239,143 @@ function getCommandLineArgs() {
     return options;
 }
 
+/**
+ * 从 stdin 读取 Claude Code Hook 输入的 JSON
+ * Hook 会通过 stdin 传入包含 session_id, cwd, transcript_path 等信息的 JSON
+ */
+function readStdinJson() {
+    return new Promise((resolve) => {
+        let data = '';
+
+        // 设置超时，如果 500ms 内没有数据就返回空对象
+        const timeout = setTimeout(() => {
+            resolve({});
+        }, 500);
+
+        process.stdin.setEncoding('utf8');
+        process.stdin.on('readable', () => {
+            let chunk;
+            while ((chunk = process.stdin.read()) !== null) {
+                data += chunk;
+            }
+        });
+
+        process.stdin.on('end', () => {
+            clearTimeout(timeout);
+            if (data.trim()) {
+                try {
+                    resolve(JSON.parse(data));
+                } catch (e) {
+                    resolve({});
+                }
+            } else {
+                resolve({});
+            }
+        });
+
+        // 非阻塞：如果 stdin 没有数据，立即结束
+        if (process.stdin.isTTY) {
+            clearTimeout(timeout);
+            resolve({});
+        }
+    });
+}
+
+/**
+ * 从 transcript 文件中读取最后一条 assistant 消息
+ * @param {string} transcriptPath - transcript 文件路径
+ * @param {number} maxLength - 最大字符数限制
+ * @returns {string} 最后一条消息内容
+ */
+function getLastAssistantMessage(transcriptPath, maxLength = 500) {
+    try {
+        if (!transcriptPath || !fs.existsSync(transcriptPath)) {
+            return '';
+        }
+
+        const content = fs.readFileSync(transcriptPath, 'utf8');
+        const lines = content.trim().split('\n');
+
+        // 从后往前找最后一条 assistant 消息
+        for (let i = lines.length - 1; i >= 0; i--) {
+            try {
+                const entry = JSON.parse(lines[i]);
+                if (entry.type === 'assistant' && entry.message && entry.message.content) {
+                    // 提取文本内容
+                    let text = '';
+                    const msgContent = entry.message.content;
+
+                    if (Array.isArray(msgContent)) {
+                        // content 是数组，提取所有 text 类型的内容
+                        for (const item of msgContent) {
+                            if (item.type === 'text' && item.text) {
+                                text += item.text + '\n';
+                            }
+                        }
+                    } else if (typeof msgContent === 'string') {
+                        text = msgContent;
+                    }
+
+                    text = text.trim();
+                    if (text) {
+                        // 截断并添加省略号
+                        if (text.length > maxLength) {
+                            text = text.substring(0, maxLength) + '...';
+                        }
+                        return text;
+                    }
+                }
+            } catch (e) {
+                // 解析失败，跳过这一行
+                continue;
+            }
+        }
+        return '';
+    } catch (error) {
+        console.log('读取 transcript 失败:', error.message);
+        return '';
+    }
+}
+
 // 如果直接运行此脚本
 if (require.main === module) {
     const options = getCommandLineArgs();
-    const taskInfo = options.message || options.task || "Claude Code任务已完成";
+    // 从命令行参数获取最大长度，默认 2000
+    const maxLength = parseInt(options.maxLength) || 2000;
 
-    const notifier = new NotificationSystem();
-    notifier.sendAllNotifications(taskInfo);
+    // 尝试从 stdin 读取 Hook 输入
+    readStdinJson().then((hookInput) => {
+        const notifier = new NotificationSystem();
+
+        // 构建任务信息
+        let taskInfo = options.message || options.task || "Claude Code任务已完成";
+        let lastOutput = '';
+
+        // 如果有 Hook 输入，添加额外信息
+        if (hookInput.session_id || hookInput.cwd || hookInput.transcript_path) {
+            const sessionId = hookInput.session_id ? hookInput.session_id.slice(0, 8) : '';
+            const cwd = hookInput.cwd || process.cwd();
+            const projectDir = path.basename(cwd);
+
+            // 覆盖项目名称为实际工作目录
+            notifier.projectName = projectDir;
+
+            // 构建更详细的消息
+            taskInfo = sessionId ? `[${sessionId}] ${taskInfo}` : taskInfo;
+
+            // 读取最后一条 assistant 消息
+            if (hookInput.transcript_path) {
+                lastOutput = getLastAssistantMessage(hookInput.transcript_path, maxLength);
+            }
+        }
+
+        // 如果有最后输出，附加到任务信息
+        if (lastOutput) {
+            taskInfo = `${taskInfo}\n\n📋 最后输出:\n${lastOutput}`;
+        }
+
+        notifier.sendAllNotifications(taskInfo);
+    });
 }
 
 module.exports = {

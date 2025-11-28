@@ -6,6 +6,14 @@
 require('dotenv').config();
 const https = require('https');
 const http = require('http');
+const { HttpsProxyAgent } = require('https-proxy-agent');
+
+// 获取代理 Agent
+function getProxyAgent() {
+    const proxyUrl = process.env.HTTP_PROXY || process.env.HTTPS_PROXY;
+    if (!proxyUrl) return null;
+    return new HttpsProxyAgent(proxyUrl);
+}
 
 /**
  * 飞书webhook通知类
@@ -44,20 +52,22 @@ class FeishuNotifier {
      * @returns {Promise<boolean>} 发送是否成功
      */
     async sendRichText(title, content, tags = []) {
+        // 将内容按换行分割，每行作为一个段落
+        const lines = content.split('\n');
+        const contentBlocks = lines.map(line => [
+            {
+                tag: "text",
+                text: line || " "  // 空行用空格占位
+            }
+        ]);
+
         const payload = {
             msg_type: "post",
             content: {
                 post: {
                     zh_cn: {
                         title: title,
-                        content: [
-                            [
-                                {
-                                    tag: "text",
-                                    text: content
-                                }
-                            ]
-                        ]
+                        content: contentBlocks
                     }
                 }
             }
@@ -99,6 +109,7 @@ class FeishuNotifier {
         return new Promise((resolve, reject) => {
             const data = JSON.stringify(payload);
             const url = new URL(this.webhookUrl);
+            const agent = getProxyAgent();
 
             const options = {
                 hostname: url.hostname,
@@ -107,7 +118,8 @@ class FeishuNotifier {
                 headers: {
                     'Content-Type': 'application/json',
                     'Content-Length': Buffer.byteLength(data)
-                }
+                },
+                agent: agent  // 如果有代理则使用，否则为 null
             };
 
             const protocol = url.protocol === 'https:' ? https : http;
