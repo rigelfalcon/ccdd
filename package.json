@@ -11,7 +11,10 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@anthropic-ai/claude-code": "^2.0.55",
+    "@larksuiteoapi/node-sdk": "^1.55.0",
     "dotenv": "^17.2.3",
-    "https-proxy-agent": "^7.0.6"
+    "https-proxy-agent": "^7.0.6",
+    "node-telegram-bot-api": "^0.66.0"
   }
 }
