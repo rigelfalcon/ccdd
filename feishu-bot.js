@@ -8,13 +8,19 @@
  * - Path validation (prevents traversal attacks)
  * - Input length validation
  * - Sanitized error messages
+ * - Task queue with limits
+ * - Shortcut command validation
  */
 
 require('dotenv').config();
 const lark = require('@larksuiteoapi/node-sdk');
 const path = require('path');
+const fs = require('fs');
 const { callClaude, formatResponse } = require('./claude-caller');
 const { SessionManager } = require('./session-manager');
+const { ClaudeSessionDiscovery } = require('./claude-session-discovery');
+const { TaskQueue } = require('./task-queue');
+const { ShortcutsManager } = require('./shortcuts-manager');
 
 // Security constants
 const RATE_LIMIT_WINDOW = 60 * 1000;  // 1 minute
@@ -44,12 +50,18 @@ class FeishuClaudeBot {
         this.allowedOpenIds = this.parseAllowedIds(options.allowedOpenIds || process.env.FEISHU_ALLOWED_OPEN_IDS);
         this.requireAuth = options.requireAuth !== false;  // Default: require authentication
         this.sessionManager = new SessionManager();
+        this.sessionDiscovery = new ClaudeSessionDiscovery();
+        this.taskQueue = new TaskQueue();
+        this.shortcutsManager = new ShortcutsManager();
         this.client = null;
         this.wsClient = null;
         this.isRunning = false;
 
         // Rate limiting: Map of senderId -> { count, resetTime }
         this.rateLimits = new Map();
+
+        // Active processes for cancel functionality
+        this.activeProcesses = new Map();
     }
 
     /**
@@ -142,9 +154,9 @@ class FeishuClaudeBot {
 
         // SECURITY WARNING
         if (this.requireAuth && (!this.allowedOpenIds || this.allowedOpenIds.length === 0)) {
-            console.log('[Feishu] ⚠️  WARNING: No FEISHU_ALLOWED_OPEN_IDS configured!');
-            console.log('[Feishu] ⚠️  Bot will deny ALL requests until you configure a whitelist.');
-            console.log('[Feishu] ⚠️  Send a message to get your Open ID, then add it to .env');
+            console.log('[Feishu] WARNING: No FEISHU_ALLOWED_OPEN_IDS configured!');
+            console.log('[Feishu] Bot will deny ALL requests until you configure a whitelist.');
+            console.log('[Feishu] Send a message to get your Open ID, then add it to .env');
         }
 
         console.log('[Feishu] Starting bot...');
@@ -245,6 +257,12 @@ class FeishuClaudeBot {
 
             // Check for commands
             if (text.startsWith('/')) {
+                // Check if it's a user-defined shortcut first
+                const expanded = this.shortcutsManager.expandShortcut('feishu', chatId, text);
+                if (expanded) {
+                    await this.handleChatMessage(chatId, senderId, expanded);
+                    return;
+                }
                 await this.handleCommand(chatId, senderId, text);
                 return;
             }
@@ -261,14 +279,16 @@ class FeishuClaudeBot {
      * Handle commands
      */
     async handleCommand(chatId, senderId, text) {
-        const [command, ...args] = text.split(' ');
+        const parts = text.split(/\s+/);
+        const command = parts[0].toLowerCase();
+        const args = parts.slice(1);
 
-        switch (command.toLowerCase()) {
+        switch (command) {
             case '/start':
                 await this.sendMessage(chatId,
                     `Claude Code Bot (${this.computerName})\n\n` +
                     `Your Open ID: ${senderId}\n\n` +
-                    `Commands:\n/new - Start new session\n/status - Show status\n/project <path> - Set project\n/help - Show help`
+                    `Commands:\n/new - Start new session\n/status - Show status\n/project <path> - Set project\n/sessions - List sessions\n/help - Show help`
                 );
                 break;
 
@@ -279,51 +299,44 @@ class FeishuClaudeBot {
 
             case '/status':
                 const status = this.sessionManager.getStatusString('feishu', chatId);
-                await this.sendMessage(chatId, `Current Status:\n\n${status}`);
+                const queueStatus = this.taskQueue.formatStatusMessage(chatId);
+                await this.sendMessage(chatId, `Current Status:\n\n${status}\n\n${queueStatus}`);
                 break;
 
             case '/project':
-                if (args.length > 0) {
-                    const projectPath = args.join(' ').trim();
-                    // SECURITY: Validate path
-                    const validation = this.validateProjectPath(projectPath);
-                    if (!validation.valid) {
-                        await this.sendMessage(chatId, `Invalid path: ${validation.error}`);
-                        return;
-                    }
-                    // Auto-create directory if it doesn't exist
-                    const fs = require('fs');
-                    let created = false;
-                    if (!fs.existsSync(validation.resolved)) {
-                        try {
-                            fs.mkdirSync(validation.resolved, { recursive: true });
-                            created = true;
-                        } catch (err) {
-                            await this.sendMessage(chatId, `Failed to create directory: ${err.message}`);
-                            return;
-                        }
-                    }
+                await this.handleProjectCommand(chatId, args);
+                break;
 
-                    // Check if directory is empty (Claude Code may hang on empty dirs)
-                    // If empty, create a minimal README.md so Claude Code works properly
-                    const files = fs.readdirSync(validation.resolved).filter(f => !f.startsWith('.'));
-                    if (files.length === 0) {
-                        const readmePath = require('path').join(validation.resolved, 'README.md');
-                        const dirName = require('path').basename(validation.resolved);
-                        fs.writeFileSync(readmePath, `# ${dirName}\n\nProject created via Claude Code Bot.\n`, 'utf8');
-                        await this.sendMessage(chatId, created
-                            ? `Created directory and initialized: ${validation.resolved}`
-                            : `Initialized empty directory: ${validation.resolved}`);
-                    } else if (created) {
-                        await this.sendMessage(chatId, `Created directory: ${validation.resolved}`);
-                    }
-                    this.sessionManager.setProjectDir('feishu', chatId, validation.resolved);
-                    await this.sendMessage(chatId, `Project directory set to:\n${validation.resolved}`);
+            case '/sessions':
+                await this.handleSessionsCommand(chatId);
+                break;
+
+            case '/resume':
+                if (args.length > 0) {
+                    await this.handleResumeCommand(chatId, args[0]);
                 } else {
-                    const session = this.sessionManager.getSession('feishu', chatId);
-                    const projectDir = session?.projectDir || this.defaultProjectDir;
-                    await this.sendMessage(chatId, `Current project directory:\n${projectDir}`);
+                    await this.sendMessage(chatId, 'Usage: /resume <session_id>\n\nUse /sessions to see available sessions.');
                 }
+                break;
+
+            case '/projects':
+                await this.handleProjectsCommand(chatId);
+                break;
+
+            case '/cancel':
+                await this.handleCancelCommand(chatId);
+                break;
+
+            case '/queue':
+                await this.handleQueueCommand(chatId, args);
+                break;
+
+            case '/shortcut':
+                await this.handleShortcutCommand(chatId, args);
+                break;
+
+            case '/export':
+                await this.handleExportCommand(chatId);
                 break;
 
             case '/help':
@@ -332,6 +345,257 @@ class FeishuClaudeBot {
 
             default:
                 await this.sendMessage(chatId, `Unknown command: ${command}\nUse /help for available commands.`);
+        }
+    }
+
+    /**
+     * Handle /project command
+     */
+    async handleProjectCommand(chatId, args) {
+        if (args.length > 0) {
+            const projectPath = args.join(' ').trim();
+            // SECURITY: Validate path
+            const validation = this.validateProjectPath(projectPath);
+            if (!validation.valid) {
+                await this.sendMessage(chatId, `Invalid path: ${validation.error}`);
+                return;
+            }
+            // Auto-create directory if it doesn't exist
+            let created = false;
+            if (!fs.existsSync(validation.resolved)) {
+                try {
+                    fs.mkdirSync(validation.resolved, { recursive: true });
+                    created = true;
+                } catch (err) {
+                    await this.sendMessage(chatId, `Failed to create directory: ${err.message}`);
+                    return;
+                }
+            }
+
+            // Check if directory is empty (Claude Code may hang on empty dirs)
+            const files = fs.readdirSync(validation.resolved).filter(f => !f.startsWith('.'));
+            if (files.length === 0) {
+                const readmePath = path.join(validation.resolved, 'README.md');
+                const dirName = path.basename(validation.resolved);
+                fs.writeFileSync(readmePath, `# ${dirName}\n\nProject created via Claude Code Bot.\n`, 'utf8');
+                await this.sendMessage(chatId, created
+                    ? `Created directory and initialized: ${validation.resolved}`
+                    : `Initialized empty directory: ${validation.resolved}`);
+            } else if (created) {
+                await this.sendMessage(chatId, `Created directory: ${validation.resolved}`);
+            }
+            this.sessionManager.setProjectDir('feishu', chatId, validation.resolved);
+            await this.sendMessage(chatId, `Project directory set to:\n${validation.resolved}`);
+        } else {
+            const session = this.sessionManager.getSession('feishu', chatId);
+            const projectDir = session?.projectDir || this.defaultProjectDir;
+            await this.sendMessage(chatId, `Current project directory:\n${projectDir}`);
+        }
+    }
+
+    /**
+     * Handle /sessions command - list recent Claude Code sessions
+     */
+    async handleSessionsCommand(chatId) {
+        try {
+            const sessions = this.sessionDiscovery.getRecentSessions(10);
+
+            if (sessions.length === 0) {
+                await this.sendMessage(chatId, 'No Claude Code sessions found.');
+                return;
+            }
+
+            const lines = [`Recent Sessions (${this.computerName}):\n`];
+
+            sessions.forEach((session, index) => {
+                const shortId = session.sessionId?.substring(0, 8) || 'unknown';
+                const shortPath = session.projectPath?.split(/[/\\]/).slice(-2).join('/') || 'Unknown';
+                const date = session.timestamp
+                    ? new Date(session.timestamp).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
+                    : 'Unknown';
+
+                lines.push(`${index + 1}. [${shortId}] ${shortPath}`);
+                lines.push(`   ${date}`);
+            });
+
+            lines.push('\nUse /resume <id> to continue a session');
+
+            await this.sendMessage(chatId, lines.join('\n'));
+        } catch (error) {
+            await this.sendMessage(chatId, `Error listing sessions: ${error.message}`);
+        }
+    }
+
+    /**
+     * Handle /resume command - resume a specific session
+     */
+    async handleResumeCommand(chatId, sessionIdPart) {
+        try {
+            const result = this.sessionDiscovery.findSessionById(sessionIdPart.trim());
+
+            if (!result) {
+                await this.sendMessage(chatId, `Session not found: ${sessionIdPart}\n\nUse /sessions to see available sessions.`);
+                return;
+            }
+
+            const { project, session } = result;
+
+            // Update session manager with the found session
+            this.sessionManager.updateSessionId('feishu', chatId, session.sessionId, session.cwd);
+
+            const msg = [
+                `Session resumed!`,
+                ``,
+                `Session: ${session.sessionId.substring(0, 8)}...`,
+                `Project: ${session.cwd}`,
+                `Messages: ${session.messageCount}`,
+                ``,
+                `Send a message to continue the conversation.`
+            ].join('\n');
+
+            await this.sendMessage(chatId, msg);
+        } catch (error) {
+            await this.sendMessage(chatId, `Error resuming session: ${error.message}`);
+        }
+    }
+
+    /**
+     * Handle /projects command - list Claude Code projects
+     */
+    async handleProjectsCommand(chatId) {
+        try {
+            const projectsList = this.sessionDiscovery.formatProjectsList(10);
+            await this.sendMessage(chatId, `${this.computerName}:\n\n${projectsList}`);
+        } catch (error) {
+            await this.sendMessage(chatId, `Error listing projects: ${error.message}`);
+        }
+    }
+
+    /**
+     * Handle /cancel command - cancel running task
+     */
+    async handleCancelCommand(chatId) {
+        const result = this.taskQueue.cancelCurrent(chatId);
+        await this.sendMessage(chatId, result.message);
+    }
+
+    /**
+     * Handle /queue command
+     */
+    async handleQueueCommand(chatId, args) {
+        const subCmd = args[0]?.toLowerCase();
+
+        switch (subCmd) {
+            case 'clear':
+                const clearResult = this.taskQueue.clearQueue(chatId);
+                await this.sendMessage(chatId, `Cleared ${clearResult.clearedCount} pending tasks.`);
+                break;
+
+            case 'status':
+            default:
+                const status = this.taskQueue.formatStatusMessage(chatId);
+                await this.sendMessage(chatId, status);
+                break;
+        }
+    }
+
+    /**
+     * Handle /shortcut command
+     */
+    async handleShortcutCommand(chatId, args) {
+        const subCmd = args[0]?.toLowerCase();
+
+        switch (subCmd) {
+            case 'add':
+                if (args.length < 3) {
+                    await this.sendMessage(chatId, 'Usage: /shortcut add <name> <command>\nExample: /shortcut add build run npm build');
+                    return;
+                }
+                const addName = args[1];
+                const addCommand = args.slice(2).join(' ');
+                const addResult = this.shortcutsManager.setShortcut('feishu', chatId, addName, addCommand);
+                if (addResult.success) {
+                    await this.sendMessage(chatId, `Shortcut /${addResult.name} ${addResult.isUpdate ? 'updated' : 'created'}!\nCommand: "${addCommand}"`);
+                } else {
+                    await this.sendMessage(chatId, `Error: ${addResult.error}`);
+                }
+                break;
+
+            case 'del':
+            case 'delete':
+            case 'rm':
+                if (args.length < 2) {
+                    await this.sendMessage(chatId, 'Usage: /shortcut del <name>');
+                    return;
+                }
+                const delResult = this.shortcutsManager.deleteShortcut('feishu', chatId, args[1]);
+                if (delResult.success) {
+                    await this.sendMessage(chatId, `Shortcut /${args[1]} deleted.`);
+                } else {
+                    await this.sendMessage(chatId, `Error: ${delResult.error}`);
+                }
+                break;
+
+            case 'list':
+            default:
+                const list = this.shortcutsManager.formatShortcutsList('feishu', chatId);
+                await this.sendMessage(chatId, list);
+                break;
+        }
+    }
+
+    /**
+     * Handle /export command - export conversation history
+     */
+    async handleExportCommand(chatId) {
+        try {
+            const session = this.sessionManager.getSession('feishu', chatId);
+            if (!session?.sessionId) {
+                await this.sendMessage(chatId, 'No active session to export.');
+                return;
+            }
+
+            const result = this.sessionDiscovery.findSessionById(session.sessionId);
+            if (!result) {
+                await this.sendMessage(chatId, 'Session data not found.');
+                return;
+            }
+
+            // Read the session file and format as markdown
+            const sessionFile = result.session.filePath;
+            if (!fs.existsSync(sessionFile)) {
+                await this.sendMessage(chatId, 'Session file not found.');
+                return;
+            }
+
+            const content = fs.readFileSync(sessionFile, 'utf8');
+            const lines = content.trim().split('\n');
+            const messages = [];
+
+            for (const line of lines.slice(0, 20)) {  // Limit to first 20 messages
+                try {
+                    const obj = JSON.parse(line);
+                    if (obj.type === 'user') {
+                        messages.push(`**User:** ${obj.message?.substring(0, 200)}...`);
+                    } else if (obj.type === 'assistant') {
+                        messages.push(`**Assistant:** ${obj.message?.substring(0, 200)}...`);
+                    }
+                } catch (e) { /* skip invalid lines */ }
+            }
+
+            const exportText = [
+                `Session Export`,
+                `ID: ${session.sessionId.substring(0, 8)}...`,
+                `Project: ${session.projectDir}`,
+                `Total messages: ${lines.length}`,
+                ``,
+                `Recent messages:`,
+                ...messages.slice(-10)
+            ].join('\n');
+
+            await this.sendMessage(chatId, exportText);
+        } catch (error) {
+            await this.sendMessage(chatId, `Error exporting: ${error.message}`);
         }
     }
 
@@ -345,7 +609,7 @@ class FeishuClaudeBot {
         const sessionId = session?.sessionId || null;
 
         // Send processing message
-        await this.sendMessage(chatId, '🤔 Processing...');
+        await this.sendMessage(chatId, 'Processing...');
 
         try {
             // Call Claude Code
@@ -402,17 +666,30 @@ class FeishuClaudeBot {
         const helpText = `
 Claude Code Bot (${this.computerName})
 
-Commands:
-/start - Show bot info and your Open ID
-/new - Clear current session and start fresh
-/status - Show current project and session
-/project <path> - Set project directory
-/help - Show this help message
+Session Commands:
+/new - Start new session
+/status - Show current status
+/sessions - List recent sessions
+/resume <id> - Resume a session
 
-Tips:
-- Set a project directory first with /project
-- Your session is automatically saved
-- Use /new to start a fresh conversation
+Project Commands:
+/project - Show current project
+/project <path> - Set project directory
+/projects - List all projects
+
+Task Commands:
+/cancel - Cancel running task
+/queue - Show task queue
+/queue clear - Clear pending tasks
+
+Shortcut Commands:
+/shortcut list - List your shortcuts
+/shortcut add <name> <cmd> - Create shortcut
+/shortcut del <name> - Delete shortcut
+
+Other:
+/export - Export conversation
+/help - Show this help
         `.trim();
 
         await this.sendMessage(chatId, helpText);

@@ -8,14 +8,19 @@
  * - Path validation (prevents traversal attacks)
  * - Input length validation
  * - Sanitized error messages
+ * - Task queue with limits
+ * - Shortcut command validation
  */
 
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const path = require('path');
+const fs = require('fs');
 const { callClaude, formatResponse, validateCwd } = require('./claude-caller');
 const { SessionManager } = require('./session-manager');
 const { ClaudeSessionDiscovery } = require('./claude-session-discovery');
+const { TaskQueue } = require('./task-queue');
+const { ShortcutsManager } = require('./shortcuts-manager');
 
 // Security constants
 const RATE_LIMIT_WINDOW = 60 * 1000;  // 1 minute
@@ -45,6 +50,8 @@ class TelegramClaudeBot {
         this.requireAuth = options.requireAuth !== false;  // Default: require authentication
         this.sessionManager = new SessionManager();
         this.sessionDiscovery = new ClaudeSessionDiscovery();
+        this.taskQueue = new TaskQueue();
+        this.shortcutsManager = new ShortcutsManager();
         this.bot = null;
         this.isRunning = false;
 
@@ -66,21 +73,18 @@ class TelegramClaudeBot {
      * SECURITY: If no whitelist configured and requireAuth is true, deny all
      */
     isAllowed(chatId) {
-        // If whitelist not configured
         if (!this.allowedChatIds || this.allowedChatIds.length === 0) {
-            // In strict mode, deny all if no whitelist
             if (this.requireAuth) {
                 console.log(`[Telegram] Auth denied for ${chatId}: No whitelist configured`);
                 return false;
             }
-            return true;  // Allow all only if explicitly disabled
+            return true;
         }
         return this.allowedChatIds.includes(String(chatId));
     }
 
     /**
      * Check rate limit for a chat
-     * @returns {boolean} true if allowed, false if rate limited
      */
     checkRateLimit(chatId) {
         const now = Date.now();
@@ -93,25 +97,21 @@ class TelegramClaudeBot {
 
         const limit = this.rateLimits.get(key);
 
-        // Reset if window expired
         if (now > limit.resetTime) {
             this.rateLimits.set(key, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
             return true;
         }
 
-        // Check if over limit
         if (limit.count >= RATE_LIMIT_MAX) {
             return false;
         }
 
-        // Increment count
         limit.count++;
         return true;
     }
 
     /**
      * Validate project path
-     * @returns {{valid: boolean, error: string, resolved: string}}
      */
     validateProjectPath(inputPath) {
         if (!inputPath || typeof inputPath !== 'string') {
@@ -120,26 +120,21 @@ class TelegramClaudeBot {
 
         const trimmed = inputPath.trim();
 
-        // Check length
         if (trimmed.length > 500) {
             return { valid: false, error: 'Path too long', resolved: null };
         }
 
-        // Check for path traversal
         if (trimmed.includes('..')) {
             return { valid: false, error: 'Path traversal not allowed', resolved: null };
         }
 
-        // Check against blocked patterns
         for (const pattern of BLOCKED_PATHS) {
             if (pattern.test(trimmed)) {
                 return { valid: false, error: 'Access to system directories not allowed', resolved: null };
             }
         }
 
-        // Resolve to absolute path
         const resolved = path.resolve(trimmed);
-
         return { valid: true, error: null, resolved };
     }
 
@@ -152,11 +147,10 @@ class TelegramClaudeBot {
             return false;
         }
 
-        // SECURITY WARNING: Check if authentication is properly configured
         if (this.requireAuth && (!this.allowedChatIds || this.allowedChatIds.length === 0)) {
-            console.log('[Telegram] ⚠️  WARNING: No TELEGRAM_ALLOWED_CHAT_IDS configured!');
-            console.log('[Telegram] ⚠️  Bot will deny ALL requests until you configure a whitelist.');
-            console.log('[Telegram] ⚠️  Send /start to the bot to get your Chat ID, then add it to .env');
+            console.log('[Telegram] WARNING: No TELEGRAM_ALLOWED_CHAT_IDS configured!');
+            console.log('[Telegram] Bot will deny ALL requests until you configure a whitelist.');
+            console.log('[Telegram] Send /start to the bot to get your Chat ID, then add it to .env');
         }
 
         console.log('[Telegram] Starting bot...');
@@ -196,53 +190,62 @@ class TelegramClaudeBot {
      */
     setupHandlers() {
         // Command: /start
-        this.bot.onText(/\/start/, (msg) => {
-            this.handleStart(msg);
-        });
+        this.bot.onText(/\/start/, (msg) => this.handleStart(msg));
 
         // Command: /help
-        this.bot.onText(/\/help/, (msg) => {
-            this.handleHelp(msg);
-        });
+        this.bot.onText(/\/help/, (msg) => this.handleHelp(msg));
 
         // Command: /new - new session
-        this.bot.onText(/\/new/, (msg) => {
-            this.handleNew(msg);
-        });
+        this.bot.onText(/\/new/, (msg) => this.handleNew(msg));
 
         // Command: /status
-        this.bot.onText(/\/status/, (msg) => {
-            this.handleStatus(msg);
-        });
+        this.bot.onText(/\/status/, (msg) => this.handleStatus(msg));
 
         // Command: /project <path>
-        this.bot.onText(/\/project\s+(.+)/, (msg, match) => {
-            this.handleProject(msg, match[1]);
-        });
+        this.bot.onText(/\/project\s+(.+)/, (msg, match) => this.handleProject(msg, match[1]));
 
         // Command: /project (no args - show current)
-        this.bot.onText(/^\/project$/, (msg) => {
-            this.handleProjectShow(msg);
-        });
+        this.bot.onText(/^\/project$/, (msg) => this.handleProjectShow(msg));
 
         // Command: /sessions - list Claude Code sessions
-        this.bot.onText(/\/sessions/, (msg) => {
-            this.handleSessions(msg);
-        });
+        this.bot.onText(/\/sessions/, (msg) => this.handleSessions(msg));
 
         // Command: /resume <session_id> - resume a session
-        this.bot.onText(/\/resume\s+(.+)/, (msg, match) => {
-            this.handleResume(msg, match[1]);
-        });
+        this.bot.onText(/\/resume\s+(.+)/, (msg, match) => this.handleResume(msg, match[1]));
 
         // Command: /projects - list Claude Code projects
-        this.bot.onText(/\/projects/, (msg) => {
-            this.handleProjects(msg);
-        });
+        this.bot.onText(/\/projects/, (msg) => this.handleProjects(msg));
+
+        // Command: /cancel - cancel running task
+        this.bot.onText(/\/cancel/, (msg) => this.handleCancel(msg));
+
+        // Command: /queue - show/manage queue
+        this.bot.onText(/\/queue\s*(.*)/, (msg, match) => this.handleQueue(msg, match[1]));
+
+        // Command: /shortcut - manage shortcuts
+        this.bot.onText(/\/shortcut\s*(.*)/, (msg, match) => this.handleShortcut(msg, match[1]));
+
+        // Command: /export - export conversation
+        this.bot.onText(/\/export/, (msg) => this.handleExport(msg));
 
         // Regular messages (not commands)
         this.bot.on('message', (msg) => {
-            if (!msg.text || msg.text.startsWith('/')) return;
+            if (!msg.text) return;
+
+            // Skip if it's a known command
+            if (msg.text.match(/^\/(start|help|new|status|project|sessions|resume|projects|cancel|queue|shortcut|export)/)) {
+                return;
+            }
+
+            // Check if it starts with / - might be a user shortcut
+            if (msg.text.startsWith('/')) {
+                const expanded = this.shortcutsManager.expandShortcut('telegram', msg.chat.id, msg.text);
+                if (expanded) {
+                    this.handleMessage(msg, expanded);
+                    return;
+                }
+            }
+
             this.handleMessage(msg);
         });
 
@@ -275,10 +278,10 @@ Commands:
 /new - Start a new session
 /status - Show current session info
 /project <path> - Set project directory
-/projects - List Claude Code projects
 /sessions - List recent sessions
-/resume <id> - Resume a session
-/help - Show this help
+/cancel - Cancel running task
+/shortcut - Manage shortcuts
+/help - Show all commands
 
 Just send a message to start chatting!
         `.trim();
@@ -299,7 +302,7 @@ Claude Code Bot (${this.computerName})
 
 Session Commands:
 /new - Start a new session
-/status - Show current session info
+/status - Show current status
 /sessions - List recent sessions
 /resume <id> - Resume a session
 
@@ -308,10 +311,19 @@ Project Commands:
 /project <path> - Set project directory
 /projects - List all projects
 
-Tips:
-- Use /sessions to see all Claude Code sessions
-- Use /resume to continue a previous conversation
-- Your session is automatically saved
+Task Commands:
+/cancel - Cancel running task
+/queue - Show task queue
+/queue clear - Clear pending tasks
+
+Shortcut Commands:
+/shortcut list - List your shortcuts
+/shortcut add <name> <cmd> - Create shortcut
+/shortcut del <name> - Delete shortcut
+
+Other:
+/export - Export conversation
+/help - Show this help
         `.trim();
 
         await this.bot.sendMessage(chatId, helpMessage);
@@ -322,7 +334,6 @@ Tips:
      */
     async handleNew(msg) {
         const chatId = msg.chat.id;
-
         if (!this.isAllowed(chatId)) return;
 
         this.sessionManager.clearSession('telegram', chatId);
@@ -334,11 +345,11 @@ Tips:
      */
     async handleStatus(msg) {
         const chatId = msg.chat.id;
-
         if (!this.isAllowed(chatId)) return;
 
         const status = this.sessionManager.getStatusString('telegram', chatId);
-        await this.bot.sendMessage(chatId, `Current Status:\n\n${status}`);
+        const queueStatus = this.taskQueue.formatStatusMessage(chatId);
+        await this.bot.sendMessage(chatId, `Current Status:\n\n${status}\n\n${queueStatus}`);
     }
 
     /**
@@ -346,18 +357,14 @@ Tips:
      */
     async handleProject(msg, projectPath) {
         const chatId = msg.chat.id;
-
         if (!this.isAllowed(chatId)) return;
 
-        // SECURITY: Validate path
         const validation = this.validateProjectPath(projectPath);
         if (!validation.valid) {
             await this.bot.sendMessage(chatId, `Invalid path: ${validation.error}`);
             return;
         }
 
-        // Auto-create directory if it doesn't exist
-        const fs = require('fs');
         let created = false;
         if (!fs.existsSync(validation.resolved)) {
             try {
@@ -369,12 +376,10 @@ Tips:
             }
         }
 
-        // Check if directory is empty (Claude Code may hang on empty dirs)
-        // If empty, create a minimal README.md so Claude Code works properly
         const files = fs.readdirSync(validation.resolved).filter(f => !f.startsWith('.'));
         if (files.length === 0) {
-            const readmePath = require('path').join(validation.resolved, 'README.md');
-            const dirName = require('path').basename(validation.resolved);
+            const readmePath = path.join(validation.resolved, 'README.md');
+            const dirName = path.basename(validation.resolved);
             fs.writeFileSync(readmePath, `# ${dirName}\n\nProject created via Claude Code Bot.\n`, 'utf8');
             await this.bot.sendMessage(chatId, created
                 ? `Created directory and initialized: ${validation.resolved}`
@@ -392,21 +397,18 @@ Tips:
      */
     async handleProjectShow(msg) {
         const chatId = msg.chat.id;
-
         if (!this.isAllowed(chatId)) return;
 
         const session = this.sessionManager.getSession('telegram', chatId);
         const projectDir = session?.projectDir || this.defaultProjectDir;
-
         await this.bot.sendMessage(chatId, `Current project directory:\n${projectDir}`);
     }
 
     /**
-     * Handle /sessions - list recent Claude Code sessions
+     * Handle /sessions command
      */
     async handleSessions(msg) {
         const chatId = msg.chat.id;
-
         if (!this.isAllowed(chatId)) return;
 
         try {
@@ -439,11 +441,10 @@ Tips:
     }
 
     /**
-     * Handle /resume <session_id> - resume a specific session
+     * Handle /resume command
      */
     async handleResume(msg, sessionIdPart) {
         const chatId = msg.chat.id;
-
         if (!this.isAllowed(chatId)) return;
 
         try {
@@ -455,11 +456,9 @@ Tips:
             }
 
             const { project, session } = result;
-
-            // Update session manager with the found session
             this.sessionManager.updateSessionId('telegram', chatId, session.sessionId, session.cwd);
 
-            const msg_text = [
+            const msgText = [
                 `Session resumed!`,
                 ``,
                 `Session: ${session.sessionId.substring(0, 8)}...`,
@@ -469,18 +468,17 @@ Tips:
                 `Send a message to continue the conversation.`
             ].join('\n');
 
-            await this.bot.sendMessage(chatId, msg_text);
+            await this.bot.sendMessage(chatId, msgText);
         } catch (error) {
             await this.bot.sendMessage(chatId, `Error resuming session: ${error.message}`);
         }
     }
 
     /**
-     * Handle /projects - list Claude Code projects
+     * Handle /projects command
      */
     async handleProjects(msg) {
         const chatId = msg.chat.id;
-
         if (!this.isAllowed(chatId)) return;
 
         try {
@@ -492,13 +490,152 @@ Tips:
     }
 
     /**
+     * Handle /cancel command
+     */
+    async handleCancel(msg) {
+        const chatId = msg.chat.id;
+        if (!this.isAllowed(chatId)) return;
+
+        const result = this.taskQueue.cancelCurrent(chatId);
+        await this.bot.sendMessage(chatId, result.message);
+    }
+
+    /**
+     * Handle /queue command
+     */
+    async handleQueue(msg, args) {
+        const chatId = msg.chat.id;
+        if (!this.isAllowed(chatId)) return;
+
+        const subCmd = args?.trim().toLowerCase();
+
+        switch (subCmd) {
+            case 'clear':
+                const clearResult = this.taskQueue.clearQueue(chatId);
+                await this.bot.sendMessage(chatId, `Cleared ${clearResult.clearedCount} pending tasks.`);
+                break;
+
+            case 'status':
+            default:
+                const status = this.taskQueue.formatStatusMessage(chatId);
+                await this.bot.sendMessage(chatId, status);
+                break;
+        }
+    }
+
+    /**
+     * Handle /shortcut command
+     */
+    async handleShortcut(msg, args) {
+        const chatId = msg.chat.id;
+        if (!this.isAllowed(chatId)) return;
+
+        const parts = args?.trim().split(/\s+/) || [];
+        const subCmd = parts[0]?.toLowerCase();
+
+        switch (subCmd) {
+            case 'add':
+                if (parts.length < 3) {
+                    await this.bot.sendMessage(chatId, 'Usage: /shortcut add <name> <command>\nExample: /shortcut add build run npm build');
+                    return;
+                }
+                const addName = parts[1];
+                const addCommand = parts.slice(2).join(' ');
+                const addResult = this.shortcutsManager.setShortcut('telegram', chatId, addName, addCommand);
+                if (addResult.success) {
+                    await this.bot.sendMessage(chatId, `Shortcut /${addResult.name} ${addResult.isUpdate ? 'updated' : 'created'}!\nCommand: "${addCommand}"`);
+                } else {
+                    await this.bot.sendMessage(chatId, `Error: ${addResult.error}`);
+                }
+                break;
+
+            case 'del':
+            case 'delete':
+            case 'rm':
+                if (parts.length < 2) {
+                    await this.bot.sendMessage(chatId, 'Usage: /shortcut del <name>');
+                    return;
+                }
+                const delResult = this.shortcutsManager.deleteShortcut('telegram', chatId, parts[1]);
+                if (delResult.success) {
+                    await this.bot.sendMessage(chatId, `Shortcut /${parts[1]} deleted.`);
+                } else {
+                    await this.bot.sendMessage(chatId, `Error: ${delResult.error}`);
+                }
+                break;
+
+            case 'list':
+            default:
+                const list = this.shortcutsManager.formatShortcutsList('telegram', chatId);
+                await this.bot.sendMessage(chatId, list);
+                break;
+        }
+    }
+
+    /**
+     * Handle /export command
+     */
+    async handleExport(msg) {
+        const chatId = msg.chat.id;
+        if (!this.isAllowed(chatId)) return;
+
+        try {
+            const session = this.sessionManager.getSession('telegram', chatId);
+            if (!session?.sessionId) {
+                await this.bot.sendMessage(chatId, 'No active session to export.');
+                return;
+            }
+
+            const result = this.sessionDiscovery.findSessionById(session.sessionId);
+            if (!result) {
+                await this.bot.sendMessage(chatId, 'Session data not found.');
+                return;
+            }
+
+            const sessionFile = result.session.filePath;
+            if (!fs.existsSync(sessionFile)) {
+                await this.bot.sendMessage(chatId, 'Session file not found.');
+                return;
+            }
+
+            const content = fs.readFileSync(sessionFile, 'utf8');
+            const lines = content.trim().split('\n');
+            const messages = [];
+
+            for (const line of lines.slice(0, 20)) {
+                try {
+                    const obj = JSON.parse(line);
+                    if (obj.type === 'user') {
+                        messages.push(`**User:** ${obj.message?.substring(0, 200)}...`);
+                    } else if (obj.type === 'assistant') {
+                        messages.push(`**Assistant:** ${obj.message?.substring(0, 200)}...`);
+                    }
+                } catch (e) { /* skip invalid lines */ }
+            }
+
+            const exportText = [
+                `Session Export`,
+                `ID: ${session.sessionId.substring(0, 8)}...`,
+                `Project: ${session.projectDir}`,
+                `Total messages: ${lines.length}`,
+                ``,
+                `Recent messages:`,
+                ...messages.slice(-10)
+            ].join('\n');
+
+            await this.bot.sendMessage(chatId, exportText);
+        } catch (error) {
+            await this.bot.sendMessage(chatId, `Error exporting: ${error.message}`);
+        }
+    }
+
+    /**
      * Handle regular messages - send to Claude Code
      */
-    async handleMessage(msg) {
+    async handleMessage(msg, overrideText = null) {
         const chatId = msg.chat.id;
-        const text = msg.text;
+        const text = overrideText || msg.text;
 
-        // SECURITY: Check authentication
         if (!this.isAllowed(chatId)) {
             await this.bot.sendMessage(chatId,
                 `Access denied.\n\nYour Chat ID: ${chatId}\n\nAdd this ID to TELEGRAM_ALLOWED_CHAT_IDS in .env to authorize.`
@@ -506,55 +643,43 @@ Tips:
             return;
         }
 
-        // SECURITY: Check rate limit
         if (!this.checkRateLimit(chatId)) {
             await this.bot.sendMessage(chatId, 'Rate limit exceeded. Please wait a moment.');
             return;
         }
 
-        // SECURITY: Validate input length
         if (text.length > MAX_MESSAGE_LENGTH) {
             await this.bot.sendMessage(chatId, `Message too long. Max ${MAX_MESSAGE_LENGTH} characters.`);
             return;
         }
 
-        // Get session info
         const session = this.sessionManager.getSession('telegram', chatId);
         const projectDir = session?.projectDir || this.defaultProjectDir;
         const sessionId = session?.sessionId || null;
 
-        // Send "typing" indicator
         await this.bot.sendChatAction(chatId, 'typing');
-
-        // Send acknowledgment
-        const thinkingMsg = await this.bot.sendMessage(chatId, '🤔 Processing...');
+        const thinkingMsg = await this.bot.sendMessage(chatId, 'Processing...');
 
         try {
-            // Call Claude Code
             const result = await callClaude(text, {
                 cwd: projectDir,
                 sessionId: sessionId,
-                timeout: 5 * 60 * 1000  // 5 minutes
+                timeout: 5 * 60 * 1000
             });
 
-            // Update session only if successful
             if (result.success && result.sessionId) {
                 this.sessionManager.updateSessionId('telegram', chatId, result.sessionId, projectDir);
             } else if (result.invalidSession && sessionId) {
-                // Only clear session if it's specifically invalid (not for timeouts or other errors)
                 console.log(`[Telegram] Clearing invalid session for ${chatId}`);
                 this.sessionManager.clearSession('telegram', chatId);
             }
 
-            // Delete thinking message
             try {
                 await this.bot.deleteMessage(chatId, thinkingMsg.message_id);
             } catch (e) { /* Ignore delete errors */ }
 
-            // Format and send response
             const response = formatResponse(result.result, 4000);
 
-            // Split long messages
             if (response.length > 4000) {
                 const chunks = this.splitMessage(response, 4000);
                 for (const chunk of chunks) {
@@ -565,15 +690,12 @@ Tips:
             }
 
         } catch (error) {
-            // Log error internally but don't expose details
             console.log('[Telegram] Error calling Claude:', error.message);
 
-            // Delete thinking message
             try {
                 await this.bot.deleteMessage(chatId, thinkingMsg.message_id);
             } catch (e) { /* Ignore */ }
 
-            // SECURITY: Generic error message (don't leak details)
             await this.bot.sendMessage(chatId, 'An error occurred. Please try again.');
         }
     }
@@ -591,7 +713,6 @@ Tips:
                 break;
             }
 
-            // Find a good break point
             let breakPoint = remaining.lastIndexOf('\n', maxLength);
             if (breakPoint === -1 || breakPoint < maxLength / 2) {
                 breakPoint = remaining.lastIndexOf(' ', maxLength);
