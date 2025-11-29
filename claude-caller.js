@@ -194,11 +194,20 @@ async function callClaude(prompt, options = {}) {
                 if (stderr) {
                     console.log(`[Claude] stderr: ${stderr.substring(0, 200)}`);
                 }
+
+                // Check if error is due to invalid session ID
+                const isInvalidSession = stderr && (
+                    stderr.includes('No conversation found with session ID') ||
+                    stderr.includes('Invalid session') ||
+                    stderr.includes('session not found')
+                );
+
                 resolve({
                     // Generic error message to user (don't leak system details)
                     result: 'Claude Code encountered an error. Please try again.',
                     sessionId: null,
-                    success: false
+                    success: false,
+                    invalidSession: isInvalidSession  // Flag for session-specific errors
                 });
                 return;
             }

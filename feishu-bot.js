@@ -355,9 +355,13 @@ class FeishuClaudeBot {
                 timeout: 5 * 60 * 1000
             });
 
-            // Update session
-            if (result.sessionId) {
+            // Update session only if successful
+            if (result.success && result.sessionId) {
                 this.sessionManager.updateSessionId('feishu', chatId, result.sessionId, projectDir);
+            } else if (result.invalidSession && sessionId) {
+                // Only clear session if it's specifically invalid (not for timeouts or other errors)
+                console.log(`[Feishu] Clearing invalid session for ${chatId}`);
+                this.sessionManager.clearSession('feishu', chatId);
             }
 
             // Format and send response

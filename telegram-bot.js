@@ -537,9 +537,13 @@ Tips:
                 timeout: 5 * 60 * 1000  // 5 minutes
             });
 
-            // Update session
-            if (result.sessionId) {
+            // Update session only if successful
+            if (result.success && result.sessionId) {
                 this.sessionManager.updateSessionId('telegram', chatId, result.sessionId, projectDir);
+            } else if (result.invalidSession && sessionId) {
+                // Only clear session if it's specifically invalid (not for timeouts or other errors)
+                console.log(`[Telegram] Clearing invalid session for ${chatId}`);
+                this.sessionManager.clearSession('telegram', chatId);
             }
 
             // Delete thinking message

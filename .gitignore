@@ -44,3 +44,4 @@ coverage/
 .npm/
 sessions.json
 sessions.json
+*.json
