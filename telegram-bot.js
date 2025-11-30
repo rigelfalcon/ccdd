@@ -26,6 +26,7 @@ const { ShortcutsManager } = require('./shortcuts-manager');
 const RATE_LIMIT_WINDOW = 60 * 1000;  // 1 minute
 const RATE_LIMIT_MAX = 10;            // Max 10 requests per minute
 const MAX_MESSAGE_LENGTH = 10000;     // Max message length
+const RATE_LIMIT_CLEANUP_INTERVAL = 5 * 60 * 1000;  // Cleanup every 5 minutes
 
 // Blocked path patterns (system directories)
 const BLOCKED_PATHS = [
@@ -57,6 +58,31 @@ class TelegramClaudeBot {
 
         // Rate limiting: Map of chatId -> { count, resetTime }
         this.rateLimits = new Map();
+        this.rateLimitCleanupTimer = null;
+    }
+
+    /**
+     * Start rate limit cleanup timer
+     */
+    startRateLimitCleanup() {
+        this.rateLimitCleanupTimer = setInterval(() => {
+            const now = Date.now();
+            for (const [key, limit] of this.rateLimits) {
+                if (now > limit.resetTime) {
+                    this.rateLimits.delete(key);
+                }
+            }
+        }, RATE_LIMIT_CLEANUP_INTERVAL);
+    }
+
+    /**
+     * Stop rate limit cleanup timer
+     */
+    stopRateLimitCleanup() {
+        if (this.rateLimitCleanupTimer) {
+            clearInterval(this.rateLimitCleanupTimer);
+            this.rateLimitCleanupTimer = null;
+        }
     }
 
     /**
@@ -170,6 +196,7 @@ class TelegramClaudeBot {
 
         this.setupHandlers();
         this.isRunning = true;
+        this.startRateLimitCleanup();
         console.log('[Telegram] Bot started successfully');
         return true;
     }
@@ -181,6 +208,7 @@ class TelegramClaudeBot {
         if (this.bot) {
             this.bot.stopPolling();
             this.isRunning = false;
+            this.stopRateLimitCleanup();
             console.log('[Telegram] Bot stopped');
         }
     }

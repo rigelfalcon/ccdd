@@ -7,6 +7,7 @@
  * - Command content validation
  * - Maximum shortcuts per user
  * - Blocked dangerous patterns
+ * - File locking for concurrent access
  */
 
 const fs = require('fs');
@@ -33,7 +34,39 @@ const BLOCKED_PATTERNS = [
 class ShortcutsManager {
     constructor(dataFile = null) {
         this.dataFile = dataFile || path.join(__dirname, 'shortcuts.json');
+        this.lockFile = this.dataFile + '.lock';
         this.shortcuts = this.load();
+    }
+
+    /**
+     * Acquire file lock
+     */
+    acquireLock() {
+        const maxWait = 5000;
+        const start = Date.now();
+        while (fs.existsSync(this.lockFile)) {
+            try {
+                const stat = fs.statSync(this.lockFile);
+                if (Date.now() - stat.mtimeMs > 10000) {
+                    fs.unlinkSync(this.lockFile);
+                    break;
+                }
+            } catch (e) { break; }
+            if (Date.now() - start > maxWait) {
+                try { fs.unlinkSync(this.lockFile); } catch (e) {}
+                break;
+            }
+            const waitUntil = Date.now() + 50;
+            while (Date.now() < waitUntil) {}
+        }
+        fs.writeFileSync(this.lockFile, process.pid.toString());
+    }
+
+    /**
+     * Release file lock
+     */
+    releaseLock() {
+        try { fs.unlinkSync(this.lockFile); } catch (e) {}
     }
 
     /**
@@ -52,13 +85,16 @@ class ShortcutsManager {
     }
 
     /**
-     * Save shortcuts to file
+     * Save shortcuts to file with locking
      */
     save() {
         try {
+            this.acquireLock();
             fs.writeFileSync(this.dataFile, JSON.stringify(this.shortcuts, null, 2));
         } catch (e) {
             console.log('[ShortcutsManager] Failed to save shortcuts:', e.message);
+        } finally {
+            this.releaseLock();
         }
     }
 
@@ -76,25 +112,18 @@ class ShortcutsManager {
         if (!name || typeof name !== 'string') {
             return { valid: false, error: 'Shortcut name is required' };
         }
-
         const trimmed = name.trim().toLowerCase();
-
         if (trimmed.length > MAX_SHORTCUT_NAME_LENGTH) {
             return { valid: false, error: `Name too long (max ${MAX_SHORTCUT_NAME_LENGTH} chars)` };
         }
-
-        // Only allow alphanumeric and underscore
         if (!/^[a-z0-9_]+$/.test(trimmed)) {
             return { valid: false, error: 'Name can only contain letters, numbers, and underscores' };
         }
-
-        // Reserved names
         const reserved = ['help', 'start', 'new', 'status', 'project', 'cancel',
                          'queue', 'sessions', 'resume', 'projects', 'shortcuts', 'export'];
         if (reserved.includes(trimmed)) {
             return { valid: false, error: `"${trimmed}" is a reserved command name` };
         }
-
         return { valid: true, error: null, name: trimmed };
     }
 
@@ -105,20 +134,15 @@ class ShortcutsManager {
         if (!command || typeof command !== 'string') {
             return { valid: false, error: 'Command content is required' };
         }
-
         const trimmed = command.trim();
-
         if (trimmed.length > MAX_SHORTCUT_CONTENT_LENGTH) {
             return { valid: false, error: `Command too long (max ${MAX_SHORTCUT_CONTENT_LENGTH} chars)` };
         }
-
-        // Check for blocked patterns
         for (const pattern of BLOCKED_PATTERNS) {
             if (pattern.test(trimmed)) {
                 return { valid: false, error: 'Command contains blocked dangerous pattern' };
             }
         }
-
         return { valid: true, error: null, command: trimmed };
     }
 
@@ -130,7 +154,6 @@ class ShortcutsManager {
         if (!nameValidation.valid) {
             return { success: false, error: nameValidation.error };
         }
-
         const commandValidation = this.validateCommand(command);
         if (!commandValidation.valid) {
             return { success: false, error: commandValidation.error };
@@ -141,7 +164,6 @@ class ShortcutsManager {
             this.shortcuts[key] = {};
         }
 
-        // Check max shortcuts
         const currentCount = Object.keys(this.shortcuts[key]).length;
         const isUpdate = this.shortcuts[key].hasOwnProperty(nameValidation.name);
 
@@ -177,12 +199,10 @@ class ShortcutsManager {
         if (!this.shortcuts[key]) {
             return { success: false, error: 'Shortcut not found' };
         }
-
         const normalizedName = name.toLowerCase();
         if (!this.shortcuts[key][normalizedName]) {
             return { success: false, error: 'Shortcut not found' };
         }
-
         delete this.shortcuts[key][normalizedName];
         this.save();
         return { success: true };
@@ -207,22 +227,18 @@ class ShortcutsManager {
      */
     formatShortcutsList(platform, chatId) {
         const shortcuts = this.listShortcuts(platform, chatId);
-
         if (shortcuts.length === 0) {
             return 'No shortcuts defined.\n\nUse /shortcut add <name> <command> to create one.\nExample: /shortcut add build run npm build';
         }
-
         const lines = ['Your Shortcuts:\n'];
         shortcuts.forEach((s, i) => {
             const cmdPreview = s.command.length > 40 ? s.command.substring(0, 37) + '...' : s.command;
             lines.push(`${i + 1}. /${s.name} -> "${cmdPreview}"`);
         });
-
         lines.push('\nUsage:');
         lines.push('/shortcut add <name> <command>');
         lines.push('/shortcut del <name>');
         lines.push('/shortcut list');
-
         return lines.join('\n');
     }
 
@@ -233,23 +249,17 @@ class ShortcutsManager {
         if (!message.startsWith('/')) {
             return null;
         }
-
         const parts = message.substring(1).split(/\s+/);
         const shortcutName = parts[0].toLowerCase();
         const command = this.getShortcut(platform, chatId, shortcutName);
-
         if (!command) {
             return null;
         }
-
-        // Replace $1, $2, etc. with arguments
         let expanded = command;
         for (let i = 1; i < parts.length; i++) {
             expanded = expanded.replace(new RegExp(`\\$${i}`, 'g'), parts[i]);
         }
-        // Remove unused placeholders
         expanded = expanded.replace(/\$\d+/g, '').trim();
-
         return expanded;
     }
 }

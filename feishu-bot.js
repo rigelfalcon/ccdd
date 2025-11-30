@@ -26,6 +26,7 @@ const { ShortcutsManager } = require('./shortcuts-manager');
 const RATE_LIMIT_WINDOW = 60 * 1000;  // 1 minute
 const RATE_LIMIT_MAX = 10;            // Max 10 requests per minute
 const MAX_MESSAGE_LENGTH = 10000;     // Max message length
+const RATE_LIMIT_CLEANUP_INTERVAL = 5 * 60 * 1000;  // Cleanup every 5 minutes
 
 // Blocked path patterns (system directories)
 const BLOCKED_PATHS = [
@@ -59,9 +60,34 @@ class FeishuClaudeBot {
 
         // Rate limiting: Map of senderId -> { count, resetTime }
         this.rateLimits = new Map();
+        this.rateLimitCleanupTimer = null;
 
         // Active processes for cancel functionality
         this.activeProcesses = new Map();
+    }
+
+    /**
+     * Start rate limit cleanup timer
+     */
+    startRateLimitCleanup() {
+        this.rateLimitCleanupTimer = setInterval(() => {
+            const now = Date.now();
+            for (const [key, limit] of this.rateLimits) {
+                if (now > limit.resetTime) {
+                    this.rateLimits.delete(key);
+                }
+            }
+        }, RATE_LIMIT_CLEANUP_INTERVAL);
+    }
+
+    /**
+     * Stop rate limit cleanup timer
+     */
+    stopRateLimitCleanup() {
+        if (this.rateLimitCleanupTimer) {
+            clearInterval(this.rateLimitCleanupTimer);
+            this.rateLimitCleanupTimer = null;
+        }
     }
 
     /**
@@ -188,6 +214,7 @@ class FeishuClaudeBot {
                 eventDispatcher: eventDispatcher
             });
             this.isRunning = true;
+            this.startRateLimitCleanup();
             console.log('[Feishu] Bot started successfully');
             return true;
         } catch (error) {
@@ -202,6 +229,7 @@ class FeishuClaudeBot {
     stop() {
         if (this.wsClient) {
             this.isRunning = false;
+            this.stopRateLimitCleanup();
             console.log('[Feishu] Bot stopped');
         }
     }

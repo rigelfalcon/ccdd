@@ -6,6 +6,7 @@
 const { spawn, execSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 
 // Maximum allowed prompt length (10KB)
 const MAX_PROMPT_LENGTH = 10000;
@@ -119,8 +120,10 @@ async function callClaude(prompt, options = {}) {
         console.log(`[Claude] Working directory: ${cwd}`);
 
         // Write prompt to temp file to avoid shell encoding issues on Windows
+        // SECURITY: Use crypto for safe random filename (no special chars)
         const tempDir = require('os').tmpdir();
-        const tempFile = path.join(tempDir, `claude-prompt-${Date.now()}.txt`);
+        const safeId = crypto.randomBytes(8).toString('hex');
+        const tempFile = path.join(tempDir, `claude-prompt-${safeId}.txt`);
         fs.writeFileSync(tempFile, promptValidation.sanitized, 'utf8');
 
         // Build command using stdin from file
