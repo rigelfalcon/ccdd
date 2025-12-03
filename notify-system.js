@@ -282,7 +282,75 @@ function readStdinJson() {
 }
 
 /**
+ * Find the most recent Droid session file for a given working directory
+ * Droid stores sessions in ~/.factory/sessions/<encoded-path>/<session-id>.jsonl
+ * @param {string} cwd - The working directory to find sessions for
+ * @returns {string|null} Path to the most recent session file, or null if not found
+ */
+function findDroidSessionFile(cwd) {
+    try {
+        const os = require('os');
+        const factorySessionsDir = path.join(os.homedir(), '.factory', 'sessions');
+        
+        if (!fs.existsSync(factorySessionsDir)) {
+            return null;
+        }
+
+        // Encode the cwd path similar to how Droid does it
+        // Droid uses: C:\path\to -> -C-path-to
+        let encodedPath = cwd
+            .replace(/:/g, '')       // Remove colons
+            .replace(/\\/g, '-')     // Replace backslashes with -
+            .replace(/\//g, '-');    // Replace forward slashes with -
+        
+        // Try to find a matching directory
+        const dirs = fs.readdirSync(factorySessionsDir, { withFileTypes: true });
+        let matchingDir = null;
+        
+        for (const dir of dirs) {
+            if (dir.isDirectory()) {
+                // Check if this directory matches our cwd (case insensitive on Windows)
+                if (dir.name.toLowerCase() === encodedPath.toLowerCase() ||
+                    dir.name.toLowerCase() === `-${encodedPath.toLowerCase()}`) {
+                    matchingDir = path.join(factorySessionsDir, dir.name);
+                    break;
+                }
+            }
+        }
+        
+        if (!matchingDir) {
+            return null;
+        }
+        
+        // Find the most recent .jsonl file (not .settings.json)
+        const files = fs.readdirSync(matchingDir)
+            .filter(f => f.endsWith('.jsonl') && !f.includes('.settings.'));
+        
+        if (files.length === 0) {
+            return null;
+        }
+        
+        // Sort by modification time, most recent first
+        const sortedFiles = files
+            .map(f => ({
+                name: f,
+                path: path.join(matchingDir, f),
+                mtime: fs.statSync(path.join(matchingDir, f)).mtime
+            }))
+            .sort((a, b) => b.mtime - a.mtime);
+        
+        return sortedFiles[0].path;
+    } catch (error) {
+        console.log('Error finding Droid session file:', error.message);
+        return null;
+    }
+}
+
+/**
  * 从 transcript 文件中读取最后一条 assistant 消息
+ * 支持 Claude Code 和 Droid 两种格式:
+ * - Claude Code: {"type": "assistant", "message": {"content": [...]}}
+ * - Droid: {"type": "message", "message": {"role": "assistant", "content": [...]}}
  * @param {string} transcriptPath - transcript 文件路径
  * @param {number} maxLength - 最大字符数限制
  * @returns {string} 最后一条消息内容
@@ -300,7 +368,12 @@ function getLastAssistantMessage(transcriptPath, maxLength = 500) {
         for (let i = lines.length - 1; i >= 0; i--) {
             try {
                 const entry = JSON.parse(lines[i]);
-                if (entry.type === 'assistant' && entry.message && entry.message.content) {
+                
+                // Check if this is an assistant message (supports both Claude Code and Droid formats)
+                const isClaudeCodeAssistant = entry.type === 'assistant' && entry.message && entry.message.content;
+                const isDroidAssistant = entry.type === 'message' && entry.message && entry.message.role === 'assistant' && entry.message.content;
+                
+                if (isClaudeCodeAssistant || isDroidAssistant) {
                     // 提取文本内容
                     let text = '';
                     const msgContent = entry.message.content;
@@ -342,10 +415,17 @@ if (require.main === module) {
     const options = getCommandLineArgs();
     // 从命令行参数获取最大长度，默认 2000
     const maxLength = parseInt(options.maxLength) || 2000;
+    // Enable debug mode with --debug flag
+    const debugMode = options.debug === true || options.debug === 'true';
 
     // 尝试从 stdin 读取 Hook 输入
     readStdinJson().then((hookInput) => {
         const notifier = new NotificationSystem();
+
+        // Debug: log the raw hook input
+        if (debugMode) {
+            console.log('[DEBUG] Hook input received:', JSON.stringify(hookInput, null, 2));
+        }
 
         // 构建任务信息
         let taskInfo = options.message || options.task || "Claude Code任务已完成";
@@ -363,9 +443,39 @@ if (require.main === module) {
             // 构建更详细的消息
             taskInfo = sessionId ? `[${sessionId}] ${taskInfo}` : taskInfo;
 
+            // Debug: log transcript path
+            if (debugMode) {
+                console.log('[DEBUG] transcript_path:', hookInput.transcript_path);
+                console.log('[DEBUG] hook_event_name:', hookInput.hook_event_name);
+            }
+
             // 读取最后一条 assistant 消息
-            if (hookInput.transcript_path) {
-                lastOutput = getLastAssistantMessage(hookInput.transcript_path, maxLength);
+            let transcriptPath = hookInput.transcript_path;
+            
+            // If transcript_path is not provided or doesn't exist, try to find it
+            if (!transcriptPath || !fs.existsSync(transcriptPath)) {
+                if (debugMode) {
+                    console.log('[DEBUG] transcript_path not found, trying Droid session discovery...');
+                }
+                // Try Droid session discovery as fallback
+                transcriptPath = findDroidSessionFile(cwd);
+                if (debugMode) {
+                    console.log('[DEBUG] Droid session file found:', transcriptPath);
+                }
+            }
+            
+            if (transcriptPath && fs.existsSync(transcriptPath)) {
+                lastOutput = getLastAssistantMessage(transcriptPath, maxLength);
+                if (debugMode) {
+                    console.log('[DEBUG] lastOutput length:', lastOutput.length);
+                    console.log('[DEBUG] lastOutput preview:', lastOutput.substring(0, 200));
+                }
+            } else if (debugMode) {
+                console.log('[DEBUG] No valid transcript path found');
+            }
+        } else {
+            if (debugMode) {
+                console.log('[DEBUG] No hook input with session_id/cwd/transcript_path');
             }
         }
 
